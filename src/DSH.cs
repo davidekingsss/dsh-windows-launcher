@@ -52,6 +52,7 @@
 using System;
 using System.Diagnostics;
 using System.Drawing;
+using System.Drawing.Imaging;
 using System.IO;
 using System.Net;
 using System.Runtime.InteropServices;
@@ -247,6 +248,119 @@ internal static class Dsh
         catch (Exception ex) { Trace("Ui marshal failed: " + ex.Message); }
     }
 
+    // ---- boot feedback: the tray icon blinks while the server comes up -----
+    static Icon _idleIcon;
+    static System.Windows.Forms.Timer _blink;
+    static int _blinkPhase;
+    static int _bootSeconds;
+
+    /// <summary>
+    /// A dimmed twin of the tray icon, rebuilt from the .ico at its own natural
+    /// size. Drawing the icon (rather than mutating a ToBitmap() copy pixel by
+    /// pixel) avoids the size mismatch that made an earlier attempt throw
+    /// "the requested range extends past the end of the array": ToBitmap() on an
+    /// Icon does not guarantee the dimensions GetPixel() is then told to expect.
+    /// Alternating the two reads as a blink and needs no animation infrastructure;
+    /// at 16 px a pulsing luminance is more noticeable than a spinner would be.
+    /// </summary>
+    static Icon MakeDimIcon(Icon source)
+    {
+        try
+        {
+            Size size = source.Size;
+            if (size.Width <= 0 || size.Height <= 0) return source;
+
+            using (var bmp = new Bitmap(size.Width, size.Height))
+            {
+                using (var g = Graphics.FromImage(bmp))
+                {
+                    g.Clear(Color.Transparent);
+                    g.DrawIcon(source, new Rectangle(0, 0, size.Width, size.Height));
+                }
+
+                // Keep a third of the alpha so the silhouette stays readable.
+                var rect = new Rectangle(0, 0, bmp.Width, bmp.Height);
+                var data = bmp.LockBits(rect, ImageLockMode.ReadWrite, PixelFormat.Format32bppArgb);
+                try
+                {
+                    int bytes = Math.Abs(data.Stride) * bmp.Height;
+                    var buf = new byte[bytes];
+                    Marshal.Copy(data.Scan0, buf, 0, bytes);
+                    for (int i = 0; i + 3 < buf.Length; i += 4)
+                    {
+                        byte a = buf[i + 3];
+                        if (a == 0) continue;
+                        buf[i + 3] = (byte)(a / 3);
+                    }
+                    Marshal.Copy(buf, 0, data.Scan0, bytes);
+                }
+                finally { bmp.UnlockBits(data); }
+
+                IntPtr h = bmp.GetHicon();
+                try { return (Icon)Icon.FromHandle(h).Clone(); }
+                finally { DestroyIcon(h); }
+            }
+        }
+        catch (Exception ex) { Trace("MakeDimIcon failed: " + ex.Message); return source; }
+    }
+
+    [DllImport("user32.dll", SetLastError = true)]
+    static extern bool DestroyIcon(IntPtr handle);
+
+    /// <summary>Begin blinking; call on the UI thread. Idempotent.</summary>
+    static void StartBlink()
+    {
+        try
+        {
+            if (_tray == null) return;
+            if (_idleIcon == null) _idleIcon = MakeDimIcon(_icon);
+            _bootSeconds = 0;
+            SetTrayText("DSH is starting…");
+
+            if (_blink == null)
+            {
+                _blink = new System.Windows.Forms.Timer { Interval = 450 };
+                _blink.Tick += (s, e) =>
+                {
+                    if (_tray == null) return;
+                    _blinkPhase++;
+                    _tray.Icon = (_blinkPhase % 2 == 0) ? _icon : _idleIcon;
+                    if (_blinkPhase % 4 == 0)
+                    {
+                        _bootSeconds += 2;
+                        // Elapsed time is the honest progress signal here: the
+                        // slow part is npm resolving the newest version, and we
+                        // cannot know its percentage.
+                        SetTrayText("DSH is starting… " + _bootSeconds + "s" +
+                                    (_bootSeconds >= 10 ? " (npm may be downloading)" : ""));
+                    }
+                };
+            }
+            _blink.Start();
+            Trace("blink started (icon pulses while the server boots)");
+        }
+        catch (Exception ex) { Trace("StartBlink failed: " + ex.Message); }
+    }
+
+    /// <summary>Stop blinking and restore the steady icon; call on the UI thread.</summary>
+    static void StopBlink()
+    {
+        try { if (_blink != null && _blink.Enabled) { _blink.Stop(); Trace("blink stopped"); } }
+        catch { }
+        try { if (_tray != null) _tray.Icon = _icon; }
+        catch { }
+    }
+
+    static void SetTrayText(string tip)
+    {
+        try
+        {
+            if (_tray == null) return;
+            _tray.Text = tip.Length > 62 ? tip.Substring(0, 59) + "…" : tip;
+        }
+        catch { }
+    }
+
     static void EnqueueJob(string job) { lock (Jobs) Jobs.Enqueue(job); JobReady.Set(); }
 
     // ---- worker thread -----------------------------------------------------
@@ -322,6 +436,7 @@ internal static class Dsh
     // ---- session (worker thread) ------------------------------------------
     static void Boot(bool silent, bool appWindow)
     {
+        var sw = Stopwatch.StartNew();
         if (ProbeReady())
         {
             int holder = PortOwnerPid();
@@ -340,27 +455,62 @@ internal static class Dsh
             return;
         }
 
-        Ui(() => SetTray("starting", "DSH is starting — resolving the newest version via npx…"));
+        // Blink the tray icon while the server comes up. The slow parts are npm
+        // resolving the newest version and the process booting; neither has a
+        // knowable percentage, so the tooltip shows elapsed seconds instead.
+        Ui(StartBlink);
         if (!SpawnServer())
         {
             Ui(() =>
             {
-                SetTray("error", "DSH could not start — see the log");
+                StopBlink();
+                SetTrayText("DSH could not start — see the log");
                 Balloon("DSH could not start", "npx could not be launched. Open the log from the tray menu.");
             });
             return;
         }
 
-        if (!WaitReady(TimeSpan.FromMinutes(6))) return;   // already reported
+        if (!WaitReady(TimeSpan.FromMinutes(6))) return;   // already reported + stopped the blink
 
-        lock (Gate) { _url = LoadUrl(); }
+        // Re-read the token from the log: the server prints it right about when it
+        // becomes ready, and unlike state.txt this is written by the run we own.
+        string fresh = TokenFromLog();
+        lock (Gate) { _url = fresh ?? LoadUrl(); }
         Trace("server ready at " + _url + " (port owner pid " + PortOwnerPid() + ")");
+
+        // Never open a page we cannot authenticate: that lands the user on a 401
+        // and sends them hunting for a token. The fence can publish its URL a
+        // moment after the port answers, so give it a short bounded grace period.
+        if (!silent && _url == BaseUrl)
+        {
+            for (int i = 0; i < 10; i++)
+            {
+                Thread.Sleep(400);
+                string retry = TokenFromLog();
+                if (retry != null) { lock (Gate) { _url = retry; } break; }
+            }
+            Trace("token after grace period: " + (_url == BaseUrl ? "still unavailable" : _url));
+        }
+        bool tokenized = _url != BaseUrl;
+        long elapsed = sw.ElapsedMilliseconds / 1000;
+
         Ui(() =>
         {
-            SetTray("running", TipFor());
-            if (!silent) Balloon("DSH is ready", "Opening the DeepSeek Harness window.");
+            StopBlink();
+            SetTrayText(TipFor());
+            // One notification per outcome only. Bursts get dropped or coalesced
+            // by Windows, which is why a ready-toast fired together with a
+            // handoff-toast reads as "notifications are sometimes broken".
+            if (!silent && tokenized)
+                Balloon("DSH is ready", "Opened the harness window (" + elapsed + "s).");
+            else if (!silent)
+                Balloon("DSH is ready",
+                    "Server is up, but no valid sign-in link was published. Use Copy open link "
+                    + "from the tray menu, or restart the server.");
         });
-        if (!silent) OpenBrowser(appWindow);
+
+        if (!silent && tokenized) OpenBrowser(appWindow);
+        else if (!silent) Trace("skipped opening the browser: no authenticated URL available");
     }
 
     /// <summary>
@@ -493,7 +643,8 @@ internal static class Dsh
                 string why = ReadFailureHint();
                 Ui(() =>
                 {
-                    SetTray("error", "DSH could not start — see the log");
+                    StopBlink();
+                    SetTrayText("DSH could not start — see the log");
                     Balloon("DSH could not start (exit " + code + ")", why);
                 });
                 return false;
@@ -504,7 +655,8 @@ internal static class Dsh
         }
         Ui(() =>
         {
-            SetTray("error", "DSH did not become ready — see the log");
+            StopBlink();
+            SetTrayText("DSH did not become ready — see the log");
             Balloon("DSH did not start", "Nothing answered on port " + Port + " in time.");
         });
         return false;
@@ -750,20 +902,20 @@ internal static class Dsh
     }
 
     /// <summary>
-    /// The tokenized URL the server printed, if the log on disk belongs to the
-    /// process that currently owns the port. Matching the port owner is what
-    /// makes this safe: a log left over from an earlier server would otherwise
-    /// hand back a token that no longer authenticates.
+    /// The tokenized URL the server printed, if we can trust that it belongs to
+    /// the server running now. Two guards, in order:
+    ///   1. the URL must authenticate right now — a stale token from an earlier
+    ///      server answers 401 and is skipped;
+    ///   2. when both sides report a port owner, they must agree.
+    /// Guard 2 alone is NOT sufficient and used to break this outright:
+    /// state.txt can record portOwner=0 during a port handover, which made every
+    /// later lookup bail out and fall back to a clean URL that always 401s.
     /// </summary>
     static string TokenFromLog()
     {
         try
         {
             if (!File.Exists(LogPath)) return null;
-            int owner = PortOwnerPid();
-            int logged = LoadStateInt("portOwner");
-            if (owner <= 0) return null;
-            if (logged != 0 && logged != owner) return null;   // log predates this server
 
             string text;
             using (var fs = new FileStream(LogPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
@@ -772,12 +924,29 @@ internal static class Dsh
 
             var ms = UrlLine.Matches(text);
             if (ms.Count == 0) return null;
-            string url = ms[ms.Count - 1].Groups[1].Value.Trim();
-            int lan = url.IndexOf(" (LAN:", StringComparison.Ordinal);
-            if (lan > 0) url = url.Substring(0, lan);
-            return url;
+
+            // Newest first: the last URL the server printed is the current one.
+            for (int i = ms.Count - 1; i >= 0; i--)
+            {
+                string url = ms[i].Groups[1].Value.Trim();
+                int lan = url.IndexOf(" (LAN:", StringComparison.Ordinal);
+                if (lan > 0) url = url.Substring(0, lan);
+                if (url.IndexOf("token=", StringComparison.OrdinalIgnoreCase) < 0) continue;
+                if (!TokenStillValid(url)) continue;
+
+                int owner = PortOwnerPid();
+                int logged = LoadStateInt("portOwner");
+                if (owner > 0 && logged > 0 && owner != logged)
+                {
+                    Trace("TokenFromLog: log names port owner " + logged +
+                          " but " + owner + " holds the port; ignoring");
+                    continue;
+                }
+                return url;
+            }
         }
-        catch (Exception ex) { Trace("TokenFromLog failed: " + ex.Message); return null; }
+        catch (Exception ex) { Trace("TokenFromLog failed: " + ex.Message); }
+        return null;
     }
 
     static void OpenBrowser(bool appWindow)
@@ -794,16 +963,23 @@ internal static class Dsh
             {
                 try
                 {
+                    // UseShellExecute=true is deliberate. Launching a browser with
+                    // UseShellExecute=false from a console-less process makes it
+                    // inherit invalid stdio handles, and a hand-off to an already
+                    // running browser fails with "cannot find the file specified".
+                    // ShellExecuteEx goes through the shell's own activation path.
                     Process.Start(new ProcessStartInfo(browser)
                     {
-                        Arguments = "--app=" + url + " --window-size=1400,900",
-                        UseShellExecute = false,
-                        CreateNoWindow = true,
+                        Arguments = "--app=\"" + url + "\" --window-size=1400,900",
+                        UseShellExecute = true,
+                        WorkingDirectory = ServerCwd,
                     });
+                    Trace("app window via " + Path.GetFileName(browser));
                     return;
                 }
                 catch (Exception ex) { Trace("app-window launch failed: " + ex.Message); }
             }
+            else Trace("no Chromium found; falling back to the default browser");
         }
 
         // ShellExecute hands the URL to the default browser with no console.
@@ -1014,8 +1190,19 @@ internal static class Dsh
     static void RestartServer()
     {
         StopServer();
-        Thread.Sleep(900);
-        Boot(false, false);
+        // Wait for the port to actually come free. A fixed sleep races the OS
+        // releasing the listening socket, and losing that race makes the new
+        // server die with EADDRINUSE.
+        var sw = Stopwatch.StartNew();
+        while (sw.Elapsed < TimeSpan.FromSeconds(15))
+        {
+            if (!ProbeReady()) break;
+            Thread.Sleep(300);
+        }
+        Trace("restart: port free after " + sw.ElapsedMilliseconds + " ms");
+        // Restarting is not a request to open a page: pass silent=true so the
+        // server comes back host-only, exactly like a fresh launch.
+        Boot(true, false);
     }
 
     static void StopServer()
