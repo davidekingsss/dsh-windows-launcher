@@ -26,7 +26,7 @@ make-icon.exe   从 DSH 自带的 favicon.svg 生成多分辨率 .ico
 ## 快速开始
 
 ```powershell
-git clone https://github.com/<you>/dsh-windows-launcher.git
+git clone https://github.com/davidekingsss/dsh-windows-launcher.git
 cd dsh-windows-launcher
 .\build.ps1 -Install
 ```
