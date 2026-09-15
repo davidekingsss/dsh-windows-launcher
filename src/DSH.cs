@@ -1345,47 +1345,53 @@ internal static class Dsh
     }
 
     /// <summary>
-    /// Run npx without any console. node.exe and npx-cli.js are addressed by
-    /// absolute path rather than through `cmd /c npx`: that keeps the exit code
-    /// observable (ShellExecute cannot report one) and guarantees no cmd window,
-    /// which a batch file would show when the launcher itself is started from a
-    /// terminal. Output goes to the log file via the shell's own redirection.
+    /// Run npx without any console window.
+    ///
+    /// This invokes `npx` itself — npx.cmd, the same entry point you would type —
+    /// rather than a hardcoded node.exe plus npm's internal npx-cli.js. npx.cmd is
+    /// a shell wrapper around that cli, so the semantics are identical; measured
+    /// here as exit 0 with correct pass-through of a non-zero exit, and no conhost
+    /// process created (a console-less WinExe plus CreateNoWindow means there is
+    /// no window even though the wrapper needs cmd).
+    ///
+    /// Rejected alternative: launching a .cmd through ShellExecute. It cannot
+    /// report an exit code, and without CreateNoWindow it flashes a console when
+    /// the launcher itself was started from a terminal.
     /// </summary>
     static int RunNpx(string[] args, string logPath, TimeSpan timeout)
     {
-        string nodeExe = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "nodejs", "node.exe");
-        if (!File.Exists(nodeExe))
+        string nodeDir = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "nodejs");
+        string npxCmd = Path.Combine(nodeDir, "npx.cmd");
+        if (!File.Exists(npxCmd))
         {
-            Trace("RunNpx: node not found at " + nodeExe);
+            Trace("RunNpx: npx.cmd not found at " + npxCmd);
             return -1;
         }
 
-        string npxCli = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles),
-            "nodejs", "node_modules", "npm", "bin", "npx-cli.js");
-        if (!File.Exists(npxCli))
-        {
-            Trace("RunNpx: npx-cli.js not found at " + npxCli);
-            return -1;
-        }
-
-        // npx <package> <args...>. Deliberately no --yes: this form names the
-        // package explicitly rather than through -p, so there is no install prompt
-        // to suppress — and `dsh plugin` forwards every trailing argument verbatim
-        // to pnpm, which rejects a stray --yes with "Unknown option: 'yes'".
-        string quoted = "\"" + npxCli + "\" " + NpxTarget;
-        foreach (var a in args) quoted += " \"" + a.Replace("\"", "") + "\"";
-        string command = "\"" + nodeExe + "\" " + quoted + " > \"" + logPath + "\" 2>&1";
+        // Quoting. Exactly this, verified by controlled variation against both a
+        // spaced and an unspaced cmd.exe path:
+        //
+        //     "/d /s /c ""<npx.cmd>" <pkg> <args...> > "<log>" 2>&1"
+        //
+        // cmd wants the batch path in doubled quotes after /c, and .NET itself
+        // contributes the outermost pair (its BuildArguments always wraps the
+        // argument string). Writing that outer pair by hand produces three quotes
+        // and cmd then mis-parses the nesting: exit 1, no output, nothing in the
+        // log. Measured, not reasoned — both cmd paths fail with three quotes and
+        // both succeed with two.
+        string command = "/d /s /c \"\"" + npxCmd + "\" " + NpxTarget;
+        foreach (var a in args) command += " " + a.Replace("\"", "");
+        command += " > \"" + logPath + "\" 2>&1\"";
 
         try
         {
             Trace("RunNpx: " + command);
             var psi = new ProcessStartInfo(Path.Combine(Environment.SystemDirectory, "cmd.exe"),
-                "/d /s /c \"" + command + "\"")
+                command)
             {
                 UseShellExecute = false,
-                CreateNoWindow = true,        // no console, even if launched from a terminal
+                CreateNoWindow = true,
                 WorkingDirectory = ServerCwd,
             };
             psi.EnvironmentVariables["npm_config_update_notifier"] = "false";
