@@ -19,8 +19,8 @@ Write-Host 'building make-icon.exe ...'
     /reference:System.Drawing.dll (Join-Path $root 'src\MakeIcon.cs')
 if ($LASTEXITCODE -ne 0) { throw 'make-icon build failed' }
 
-Write-Host 'generating DSH.ico ...'
-& "$dist\make-icon.exe" (Join-Path $root 'assets\favicon.svg') "$dist\DSH.ico"
+Write-Host 'generating DSH.ico + DSH-dim.ico ...'
+& "$dist\make-icon.exe" (Join-Path $root 'assets\favicon.svg') "$dist\DSH.ico" "$dist\DSH-dim.ico"
 if ($LASTEXITCODE -ne 0) { throw 'icon generation failed' }
 
 Write-Host 'building DSH.exe ...'
@@ -36,6 +36,8 @@ if ($Install) {
     New-Item -ItemType Directory -Force -Path $target | Out-Null
     Copy-Item "$dist\DSH.exe" $target -Force
     Copy-Item "$dist\DSH.ico" $target -Force
+    # The faint twin the launcher blinks while the server starts.
+    Copy-Item "$dist\DSH-dim.ico" $target -Force
     $exe = Join-Path $target 'DSH.exe'
     $ico = Join-Path $target 'DSH.ico'
     $startDir = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs'

@@ -255,53 +255,35 @@ internal static class Dsh
     static int _bootSeconds;
 
     /// <summary>
-    /// A dimmed twin of the tray icon, rebuilt from the .ico at its own natural
-    /// size. Drawing the icon (rather than mutating a ToBitmap() copy pixel by
-    /// pixel) avoids the size mismatch that made an earlier attempt throw
-    /// "the requested range extends past the end of the array": ToBitmap() on an
-    /// Icon does not guarantee the dimensions GetPixel() is then told to expect.
-    /// Alternating the two reads as a blink and needs no animation infrastructure;
-    /// at 16 px a pulsing luminance is more noticeable than a spinner would be.
+    /// A faint twin of the tray icon, generated at build time by make-icon and
+    /// loaded the only way that works everywhere: `new Icon(path)`.
+    ///
+    /// Two run-time attempts failed before this. Both composed the twin with GDI+
+    /// and both threw `ArgumentOutOfRangeException: the requested range extends
+    /// past the end of the array` — and not because of a coding mistake: on this
+    /// machine EVERY path that decodes or rasterises image data throws, including
+    /// new Bitmap(png), Graphics.DrawImage, Graphics.DrawIcon, Bitmap.GetHicon and
+    /// System.Drawing's own Icon.ToBitmap(). Only vector drawing (GraphicsPath +
+    /// FillPath) and Icon construction from a file work. The worse failure was
+    /// silent: the fallback returned the ORIGINAL icon, so the blink alternated
+    /// between two identical images and looked like nothing happened.
     /// </summary>
-    static Icon MakeDimIcon(Icon source)
+    static Icon LoadDimIcon()
     {
         try
         {
-            Size size = source.Size;
-            if (size.Width <= 0 || size.Height <= 0) return source;
-
-            using (var bmp = new Bitmap(size.Width, size.Height))
-            {
-                using (var g = Graphics.FromImage(bmp))
-                {
-                    g.Clear(Color.Transparent);
-                    g.DrawIcon(source, new Rectangle(0, 0, size.Width, size.Height));
-                }
-
-                // Keep a third of the alpha so the silhouette stays readable.
-                var rect = new Rectangle(0, 0, bmp.Width, bmp.Height);
-                var data = bmp.LockBits(rect, ImageLockMode.ReadWrite, PixelFormat.Format32bppArgb);
-                try
-                {
-                    int bytes = Math.Abs(data.Stride) * bmp.Height;
-                    var buf = new byte[bytes];
-                    Marshal.Copy(data.Scan0, buf, 0, bytes);
-                    for (int i = 0; i + 3 < buf.Length; i += 4)
-                    {
-                        byte a = buf[i + 3];
-                        if (a == 0) continue;
-                        buf[i + 3] = (byte)(a / 3);
-                    }
-                    Marshal.Copy(buf, 0, data.Scan0, bytes);
-                }
-                finally { bmp.UnlockBits(data); }
-
-                IntPtr h = bmp.GetHicon();
-                try { return (Icon)Icon.FromHandle(h).Clone(); }
-                finally { DestroyIcon(h); }
-            }
+            string path = Path.Combine(AppDir(), "DSH-dim.ico");
+            if (!File.Exists(path)) { Trace("dim icon missing: " + path); return null; }
+            var icon = new Icon(path);
+            Trace("blink twin loaded: " + path + " (" + icon.Size + ")");
+            return icon;
         }
-        catch (Exception ex) { Trace("MakeDimIcon failed: " + ex.Message); return source; }
+        catch (Exception ex)
+        {
+            string m; try { m = ex.GetType().Name + ": " + ex.Message; } catch { m = "unprintable"; }
+            Trace("LoadDimIcon failed: " + m);
+            return null;
+        }
     }
 
     [DllImport("user32.dll", SetLastError = true)]
@@ -313,7 +295,19 @@ internal static class Dsh
         try
         {
             if (_tray == null) return;
-            if (_idleIcon == null) _idleIcon = MakeDimIcon(_icon);
+
+            if (_idleIcon == null)
+            {
+                _idleIcon = LoadDimIcon();
+                if (_idleIcon == null)
+                {
+                    // Never animate between two identical bitmaps: say so instead
+                    // of showing a blink that cannot be seen.
+                    Balloon("DSH", "Blink icon unavailable; the tray icon stays steady while the server starts.");
+                    return;
+                }
+            }
+
             _bootSeconds = 0;
             SetTrayText("DSH is starting…");
 
@@ -322,15 +316,15 @@ internal static class Dsh
                 _blink = new System.Windows.Forms.Timer { Interval = 450 };
                 _blink.Tick += (s, e) =>
                 {
-                    if (_tray == null) return;
+                    if (_tray == null || _idleIcon == null) return;
                     _blinkPhase++;
                     _tray.Icon = (_blinkPhase % 2 == 0) ? _icon : _idleIcon;
                     if (_blinkPhase % 4 == 0)
                     {
                         _bootSeconds += 2;
-                        // Elapsed time is the honest progress signal here: the
-                        // slow part is npm resolving the newest version, and we
-                        // cannot know its percentage.
+                        // Elapsed time is the honest progress signal here: the slow
+                        // part is npm resolving the newest version, and we cannot
+                        // know its percentage.
                         SetTrayText("DSH is starting… " + _bootSeconds + "s" +
                                     (_bootSeconds >= 10 ? " (npm may be downloading)" : ""));
                     }

@@ -28,23 +28,48 @@ internal static class MakeIcon
     {
         string svgPath = args[0];
         string outIco = args[1];
+        // Optional second output: the same mark drawn faint, used by the launcher
+        // to blink the tray icon while the server starts.
+        string dimIco = args.Length > 2 ? args[2] : null;
 
         string svg = File.ReadAllText(svgPath);
         var match = Regex.Match(svg, @"<path[^>]*\sd\s*=\s*""([^""]+)""", RegexOptions.Singleline);
         if (!match.Success) throw new Exception("no <path d=\"...\"> found in " + svgPath);
 
-        using (var master = RenderMaster(match.Groups[1].Value))
+        int[] sizes = { 256, 128, 96, 64, 48, 40, 32, 24, 20, 16 };
+
+        using (var master = RenderMaster(match.Groups[1].Value, 1.0f))
         {
-            int[] sizes = { 256, 128, 96, 64, 48, 40, 32, 24, 20, 16 };
             var pngs = new byte[sizes.Length][];
             for (int i = 0; i < sizes.Length; i++) pngs[i] = Encode(master, sizes[i]);
             WriteIco(outIco, sizes, pngs);
             Console.WriteLine("wrote " + outIco + " (" + sizes.Length + " sizes)");
         }
+
+        if (dimIco != null)
+        {
+            using (var dim = RenderMaster(match.Groups[1].Value, 0.30f))
+            {
+                var pngs = new byte[sizes.Length][];
+                for (int i = 0; i < sizes.Length; i++) pngs[i] = Encode(dim, sizes[i]);
+                WriteIco(dimIco, sizes, pngs);
+                Console.WriteLine("wrote " + dimIco + " (" + sizes.Length + " sizes, alpha 30%)");
+            }
+        }
     }
 
-    /// <summary>Blue rounded tile with the white whale centred on it.</summary>
-    static Bitmap RenderMaster(string d)
+    /// <summary>
+    /// Blue rounded tile with the white whale centred on it, drawn at the given
+    /// opacity. Both icon frames are produced here from vector primitives.
+    ///
+    /// Deliberately built from GraphicsPath + FillPath only. On some machines
+    /// (this author's included) every GDI+ path that decodes or rasterises image
+    /// data throws — new Bitmap(png), Graphics.DrawImage, Graphics.DrawIcon,
+    /// Bitmap.GetHicon and even System.Drawing's own Icon.ToBitmap(). Drawing the
+    /// faint twin at build time instead of compositing it at run time keeps the
+    /// launcher on APIs that work everywhere.
+    /// </summary>
+    static Bitmap RenderMaster(string d, float alpha)
     {
         var bmp = new Bitmap(Master, Master, PixelFormat.Format32bppArgb);
         using (var g = Graphics.FromImage(bmp))
@@ -54,14 +79,15 @@ internal static class MakeIcon
             g.PixelOffsetMode = PixelOffsetMode.HighQuality;
             g.Clear(Color.Transparent);
 
+            byte a = (byte)Math.Round(255 * alpha);
             using (var tile = RoundedRect(new Rectangle(0, 0, Master, Master), 58))
-            using (var brush = new SolidBrush(Brand))
+            using (var brush = new SolidBrush(Color.FromArgb(a, Brand)))
                 g.FillPath(brush, tile);
 
             float mark = Master * MarkFraction;
             float scale = mark / ViewBox;
             using (var gp = ParsePath(d))
-            using (var white = new SolidBrush(Color.White))
+            using (var white = new SolidBrush(Color.FromArgb(a, Color.White)))
             {
                 var saved = g.Save();
                 g.TranslateTransform((Master - mark) / 2f, (Master - mark) / 2f);
