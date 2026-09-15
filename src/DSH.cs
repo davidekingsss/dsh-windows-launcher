@@ -269,6 +269,25 @@ internal static class Dsh
         try
         {
             _bootSeconds = 0;
+
+            // 先闪一下再做计时。因为"服务器已在运行"这条分支不会真的启动服务器，
+            // 若不加这段过渡，"正在启动"和"已就绪"都会是常亮图标，用户无法区分。
+            if (PrepareBlinkIcon())
+            {
+                if (_blink == null)
+                {
+                    _blink = new System.Windows.Forms.Timer { Interval = 450 };
+                    _blink.Tick += (s, e) =>
+                    {
+                        if (_tray == null || _idleIcon == null) return;
+                        _blinkPhase++;
+                        _tray.Icon = (_blinkPhase % 2 == 0) ? _icon : _idleIcon;
+                    };
+                }
+                _blink.Start();
+                Trace("blink started (tray icon pulses during startup)");
+            }
+
             SetTrayText("DSH 正在启动…");
             if (_ticker == null)
             {
@@ -285,9 +304,14 @@ internal static class Dsh
         catch (Exception ex) { Trace("StartTicker failed: " + ex.Message); }
     }
 
-    static void StopTicker()
+    /// <summary>Stop the elapsed-time counter and the blinking icon.</summary>
+    static void StopBootFeedback()
     {
-        try { if (_ticker != null) _ticker.Stop(); }
+        try { if (_ticker != null && _ticker.Enabled) { _ticker.Stop(); Trace("ticker stopped at " + _bootSeconds + "s"); } }
+        catch { }
+        try { if (_blink != null && _blink.Enabled) { _blink.Stop(); Trace("blink stopped"); } }
+        catch { }
+        try { if (_tray != null) _tray.Icon = _icon; }
         catch { }
     }
 
@@ -326,39 +350,21 @@ internal static class Dsh
     [DllImport("user32.dll", SetLastError = true)]
     static extern bool DestroyIcon(IntPtr handle);
 
-    /// <summary>Begin blinking; call on the UI thread. Idempotent.</summary>
-    static void StartBlink()
+    /// <summary>
+    /// Prepare the faint twin used by the blink, once. Call on the UI thread.
+    /// Returns false when the twin is unavailable, in which case the caller keeps
+    /// the tooltip ticker as the only progress signal.
+    /// </summary>
+    static bool PrepareBlinkIcon()
     {
-        try
+        if (_idleIcon != null) return true;
+        _idleIcon = LoadDimIcon();
+        if (_idleIcon == null)
         {
-            if (_tray == null) return;
-
-            if (_idleIcon == null)
-            {
-                _idleIcon = LoadDimIcon();
-                if (_idleIcon == null)
-                {
-                    // Never animate between two identical bitmaps. Say so, and rely
-                    // on the tooltip ticker to show that work is still happening.
-                    Balloon("DSH", "变暗图标不可用，托盘图标将保持常亮；启动进度请看托盘的悬停提示。");
-                    return;
-                }
-            }
-
-            if (_blink == null)
-            {
-                _blink = new System.Windows.Forms.Timer { Interval = 450 };
-                _blink.Tick += (s, e) =>
-                {
-                    if (_tray == null || _idleIcon == null) return;
-                    _blinkPhase++;
-                    _tray.Icon = (_blinkPhase % 2 == 0) ? _icon : _idleIcon;
-                };
-            }
-            _blink.Start();
-            Trace("blink started (icon pulses while the server boots)");
+            Balloon("DSH", "变暗图标不可用，托盘图标将保持常亮；启动进度请看托盘的悬停提示。");
+            return false;
         }
-        catch (Exception ex) { Trace("StartBlink failed: " + ex.Message); }
+        return true;
     }
 
     /// <summary>Stop blinking and restore the steady icon; call on the UI thread.</summary>
@@ -456,6 +462,11 @@ internal static class Dsh
     static void Boot(bool silent, bool appWindow)
     {
         var sw = Stopwatch.StartNew();
+
+        // 无论冷启动还是"服务器已在运行"，都先进入启动反馈（图标闪烁 + 悬停提示
+        // 走秒）。否则两条路径收尾时都是常亮图标，用户看不出差别。
+        Ui(StartTicker);
+
         if (ProbeReady())
         {
             int holder = PortOwnerPid();
@@ -469,19 +480,16 @@ internal static class Dsh
             string fromLog = TokenFromLog();
             lock (Gate) { _url = fromLog ?? LoadUrl(); }
             Trace("server already up; using " + _url);
-            Ui(() => SetTray("running", TipFor()));
+            Ui(MarkRunning);
             if (!silent) OpenBrowser(appWindow);
             return;
         }
 
-        // 启动期间：图标闪烁 + 悬停提示走秒。二者相互独立，任何一条可用都能
-        // 让用户看到"正在启动"。
-        Ui(() => { StartTicker(); StartBlink(); });
         if (!SpawnServer())
         {
             Ui(() =>
             {
-                StopTicker(); StopBlink();
+                StopBootFeedback();
                 SetTrayText("DSH 启动失败 — 请查看日志");
                 Balloon("DSH 无法启动", "无法拉起 npx。请在托盘菜单里查看启动器日志。");
             });
@@ -514,8 +522,7 @@ internal static class Dsh
 
         Ui(() =>
         {
-            StopTicker(); StopBlink();
-            SetTrayText(TipFor());
+            MarkRunning();
             // 每种结果只提示一次：连发的气泡会被 Windows 丢弃或合并，这正是
             // "通知有时不弹出"的原因。
             if (!silent && tokenized)
@@ -660,7 +667,7 @@ internal static class Dsh
                 string why = ReadFailureHint();
                 Ui(() =>
                 {
-                    StopBlink();
+                    StopBootFeedback();
                     SetTrayText("DSH 启动失败 — 请查看日志");
                     Balloon("DSH 无法启动（退出码 " + code + "）", why);
                 });
@@ -672,7 +679,7 @@ internal static class Dsh
         }
         Ui(() =>
         {
-            StopTicker(); StopBlink();
+            StopBootFeedback();
             SetTrayText("DSH 启动超时 — 请查看日志");
             Balloon("DSH 未能就绪", "端口 " + Port + " 在超时前没有响应。");
         });
@@ -1109,6 +1116,13 @@ internal static class Dsh
             Visible = true,
         };
         _tray.DoubleClick += (s, e) => EnqueueJob("open");
+    }
+
+    /// <summary>Restore the steady icon and the "running" tooltip.</summary>
+    static void MarkRunning()
+    {
+        StopBootFeedback();
+        SetTrayText(TipFor());
     }
 
     static string TipFor() { return "DSH 正在运行 — 点击打开界面"; }
