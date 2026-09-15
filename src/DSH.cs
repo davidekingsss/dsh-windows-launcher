@@ -254,6 +254,10 @@ internal static class Dsh
     static System.Windows.Forms.Timer _ticker;
     static int _blinkPhase;
     static int _bootSeconds;
+    static long _blinkStartedAt;
+
+    /// <summary>Minimum time the startup blink stays on screen, in ms.</summary>
+    const int BlinkVisibleMs = 1200;
 
     /// <summary>
     /// Counts elapsed seconds in the tray tooltip while the server starts.
@@ -285,6 +289,7 @@ internal static class Dsh
                     };
                 }
                 _blink.Start();
+                _blinkStartedAt = Stopwatch.GetTimestamp();
                 Trace("blink started (tray icon pulses during startup)");
             }
 
@@ -1118,9 +1123,41 @@ internal static class Dsh
         _tray.DoubleClick += (s, e) => EnqueueJob("open");
     }
 
-    /// <summary>Restore the steady icon and the "running" tooltip.</summary>
+    /// <summary>
+    /// Restore the steady icon and the "running" tooltip, but never sooner than
+    /// MIN_BLINK_VISIBLE_MS after the blink began.
+    ///
+    /// A warm start answers the readiness probe in a few milliseconds, so without
+    /// this floor the blink lasted 28 ms and was invisible in practice — the
+    /// feedback existed but the user never saw it.
+    /// </summary>
     static void MarkRunning()
     {
+        try
+        {
+            if (_blink != null && _blink.Enabled)
+            {
+                long elapsed = Stopwatch.GetTimestamp() - _blinkStartedAt;
+                long ms = elapsed * 1000 / Stopwatch.Frequency;
+                if (ms < BlinkVisibleMs)
+                {
+                    int delay = (int)(BlinkVisibleMs - ms);
+                    Trace("holding startup feedback another " + delay + " ms so the blink is visible");
+                    var once = new System.Windows.Forms.Timer { Interval = delay };
+                    once.Tick += (s, e) =>
+                    {
+                        once.Stop();
+                        once.Dispose();
+                        StopBootFeedback();
+                        SetTrayText(TipFor());
+                    };
+                    once.Start();
+                    return;
+                }
+            }
+        }
+        catch (Exception ex) { Trace("MarkRunning delay failed: " + ex.Message); }
+
         StopBootFeedback();
         SetTrayText(TipFor());
     }
