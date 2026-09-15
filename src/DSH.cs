@@ -411,6 +411,7 @@ internal static class Dsh
                     case "stop": StopServer(); Ack("ok"); Info("服务器已停止。"); break;
                     case "restart": RestartServer(); Ack("ok"); Info("服务器已重启。"); break;
                     case "kill-orphan": KillOrphan(); Ack("ok"); Info("残留服务器已清理。"); break;
+                    case "install-market": InstallMarket(); Ack("ok"); break;
                     case "copy-link": CopyOpenLink(); Ack("ok"); break;
                     case "selftest": Ui(StartSelfTest); Ack("ok"); break;
                     case "boot": Boot(false, false); break;
@@ -1107,6 +1108,14 @@ internal static class Dsh
         menu.Items.Add(_autostartItem);
 
         menu.Items.Add(new ToolStripSeparator());
+
+        // 插件管理。装完之后按钮就置灰，避免重复安装。
+        _marketItem = new ToolStripMenuItem("安装 dshmarket 插件");
+        _marketItem.Click += (s, e) => EnqueueJob("install-market");
+        menu.Items.Add(_marketItem);
+        RefreshMarketItem();
+
+        menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add("查看服务器日志", null, (s, e) => OpenPath(LogPath));
         menu.Items.Add("查看启动器日志", null, (s, e) => OpenPath(TracePath));
         menu.Items.Add("打开安装目录", null, (s, e) => OpenPath(Home));
@@ -1221,6 +1230,183 @@ internal static class Dsh
         };
         beat.Start();
         Trace("selftest started");
+    }
+
+    // ---- profile plugin management ----------------------------------------
+    // `dsh plugin --profile <name> add <pkg>` is a thin pnpm forwarder that then
+    // reconciles dsh.profile.bundles against the installed state (the source of
+    // @deepseek-ai/dsh/plugin): a dependency that resolves to a package declaring
+    // `dsh.bundle.patch` is appended to the layer stack. So an install is only
+    // really finished when all three of these hold, and the menu entry is enabled
+    // only while they do not:
+    //   1. the package is a profile dependency,
+    //   2. it is listed in dsh.profile.bundles (otherwise nothing loads it),
+    //   3. it is materialised under the profile's node_modules.
+    const string MarketPackage = "dshmarket";
+    const string WebProfileName = "web";
+    static ToolStripMenuItem _marketItem;
+    static bool _marketInstalling;
+
+    static string WebProfileDir()
+    {
+        string home = Environment.GetEnvironmentVariable("DSH_HOME");
+        if (string.IsNullOrEmpty(home))
+            home = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".dsh");
+        return Path.Combine(home, "profiles", WebProfileName);
+    }
+
+    /// <summary>True when the package is a declared, bundled and materialised plugin.</summary>
+    static bool IsMarketInstalled()
+    {
+        try
+        {
+            string dir = WebProfileDir();
+            string manifest = Path.Combine(dir, "package.json");
+            if (!File.Exists(manifest)) return false;
+
+            string json = File.ReadAllText(manifest);
+            bool inDeps = Regex.IsMatch(json,
+                "\"" + Regex.Escape(MarketPackage) + "\"\\s*:", RegexOptions.IgnoreCase);
+            bool inBundles = json.IndexOf("\"" + MarketPackage + "\"", StringComparison.OrdinalIgnoreCase) >= 0
+                             && Regex.IsMatch(json, "bundles\"?\\s*:\\s*\\[[^\\]]*" + Regex.Escape(MarketPackage),
+                                 RegexOptions.IgnoreCase | RegexOptions.Singleline);
+            bool materialised = File.Exists(Path.Combine(dir, "node_modules", MarketPackage, "package.json"));
+
+            bool installed = inDeps && inBundles && materialised;
+            if (!installed)
+                Trace("market check: deps=" + inDeps + " bundles=" + inBundles + " files=" + materialised);
+            return installed;
+        }
+        catch (Exception ex) { Trace("IsMarketInstalled failed: " + ex.Message); return false; }
+    }
+
+    static void RefreshMarketItem()
+    {
+        try
+        {
+            if (_marketItem == null) return;
+            bool installed = IsMarketInstalled();
+            _marketItem.Enabled = !installed && !_marketInstalling;
+            _marketItem.Text = _marketInstalling
+                ? "正在安装 dshmarket…"
+                : (installed ? "dshmarket 已安装" : "安装 dshmarket 插件");
+        }
+        catch (Exception ex) { Trace("RefreshMarketItem failed: " + ex.Message); }
+    }
+
+    /// <summary>Run the install, then restart the server so the new bundle loads.</summary>
+    static void InstallMarket()
+    {
+        if (IsMarketInstalled())
+        {
+            Ui(() => Balloon("DSH", "dshmarket 已经安装过了。"));
+            return;
+        }
+
+        Ui(() =>
+        {
+            _marketInstalling = true;
+            RefreshMarketItem();
+            SetTrayText("DSH 正在安装 dshmarket…");
+        });
+
+        int code = RunNpx(new[]
+        {
+            // -w is required, not cosmetic: a profile directory carries a
+            // pnpm-workspace.yaml (packages: [.]), so pnpm treats it as a
+            // workspace root and refuses `add` with ERR_PNPM_ADDING_TO_ROOT
+            // unless the caller opts in.
+            "plugin", "--profile", WebProfileName, "add", "-w", MarketPackage,
+        }, Path.Combine(Home, "dsh-plugin-install.log"), TimeSpan.FromMinutes(10));
+
+        bool ok = code == 0 && IsMarketInstalled();
+        Ui(() =>
+        {
+            _marketInstalling = false;
+            RefreshMarketItem();
+            SetTrayText(TipFor());
+        });
+
+        if (ok)
+        {
+            Trace("dshmarket installed; restarting the server to load the new bundle");
+            Ui(() => Balloon("DSH", "dshmarket 安装完成，正在重启服务器以加载新插件。"));
+            RestartServer();
+        }
+        else
+        {
+            string hint = code == 0
+                ? "命令成功但未检测到插件生效，请查看日志。"
+                : "安装失败（退出码 " + code + "）。";
+            Trace("dshmarket install failed: exit " + code + ", detected=" + IsMarketInstalled());
+            Ui(() => Balloon("dshmarket 安装失败",
+                hint + "详情见 %LOCALAPPDATA%\\DSH\\dsh-plugin-install.log"));
+        }
+    }
+
+    /// <summary>
+    /// Run npx without any console. node.exe and npx-cli.js are addressed by
+    /// absolute path rather than through `cmd /c npx`: that keeps the exit code
+    /// observable (ShellExecute cannot report one) and guarantees no cmd window,
+    /// which a batch file would show when the launcher itself is started from a
+    /// terminal. Output goes to the log file via the shell's own redirection.
+    /// </summary>
+    static int RunNpx(string[] args, string logPath, TimeSpan timeout)
+    {
+        string nodeExe = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "nodejs", "node.exe");
+        if (!File.Exists(nodeExe))
+        {
+            Trace("RunNpx: node not found at " + nodeExe);
+            return -1;
+        }
+
+        string npxCli = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles),
+            "nodejs", "node_modules", "npm", "bin", "npx-cli.js");
+        if (!File.Exists(npxCli))
+        {
+            Trace("RunNpx: npx-cli.js not found at " + npxCli);
+            return -1;
+        }
+
+        // npx <package> <args...>. Deliberately no --yes: this form names the
+        // package explicitly rather than through -p, so there is no install prompt
+        // to suppress — and `dsh plugin` forwards every trailing argument verbatim
+        // to pnpm, which rejects a stray --yes with "Unknown option: 'yes'".
+        string quoted = "\"" + npxCli + "\" " + NpxTarget;
+        foreach (var a in args) quoted += " \"" + a.Replace("\"", "") + "\"";
+        string command = "\"" + nodeExe + "\" " + quoted + " > \"" + logPath + "\" 2>&1";
+
+        try
+        {
+            Trace("RunNpx: " + command);
+            var psi = new ProcessStartInfo(Path.Combine(Environment.SystemDirectory, "cmd.exe"),
+                "/d /s /c \"" + command + "\"")
+            {
+                UseShellExecute = false,
+                CreateNoWindow = true,        // no console, even if launched from a terminal
+                WorkingDirectory = ServerCwd,
+            };
+            psi.EnvironmentVariables["npm_config_update_notifier"] = "false";
+
+            using (var p = Process.Start(psi))
+            {
+                if (!p.WaitForExit((int)timeout.TotalMilliseconds))
+                {
+                    Trace("RunNpx: timed out after " + timeout.TotalMinutes + " min");
+                    try { p.Kill(); } catch { }
+                    return -2;
+                }
+                Trace("RunNpx: exit " + p.ExitCode);
+                return p.ExitCode;
+            }
+        }
+        catch (Exception ex)
+        {
+            Trace("RunNpx failed: " + ex.Message);
+            return -1;
+        }
     }
 
     // ---- autostart ---------------------------------------------------------
