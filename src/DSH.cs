@@ -139,9 +139,9 @@ internal static class Dsh
                                 || verb == "--kill-orphan" || verb == "--selftest";
                 string reply = Send(verb.TrimStart('-'), blocking);
                 Trace("sent verb '" + verb + "' -> " + reply);
-                if (reply == "none") Info("DSH is not running.");
+                if (reply == "none") Info("DSH 未在运行。");
                 else if (reply == "ok") Info(ReplyText(verb));
-                else if (reply == "timeout") Info("DSH did not respond in time.");
+                else if (reply == "timeout") Info("DSH 没有及时响应。");
                 return;
             }
 
@@ -216,10 +216,10 @@ internal static class Dsh
     {
         switch (verb.TrimStart('-'))
         {
-            case "restart": return "DSH server restarted.";
-            case "kill-orphan": return "Orphaned DSH server cleared.";
-            case "selftest": return "Self-test is running — see the launcher log.";
-            default: return "DSH server stopped.";
+            case "restart": return "服务器已重启。";
+            case "kill-orphan": return "残留服务器已清理。";
+            case "selftest": return "自检进行中 — 结果写入启动器日志。";
+            default: return "服务器已停止。";
         }
     }
 
@@ -251,8 +251,45 @@ internal static class Dsh
     // ---- boot feedback: the tray icon blinks while the server comes up -----
     static Icon _idleIcon;
     static System.Windows.Forms.Timer _blink;
+    static System.Windows.Forms.Timer _ticker;
     static int _blinkPhase;
     static int _bootSeconds;
+
+    /// <summary>
+    /// Counts elapsed seconds in the tray tooltip while the server starts.
+    ///
+    /// This is deliberately independent of the icon: it is the fallback that still
+    /// works when the faint twin cannot be loaded, so the user always has some
+    /// visible sign that something is happening. The slow part is npm resolving
+    /// the newest version, whose progress we cannot know, so elapsed time is the
+    /// honest signal.
+    /// </summary>
+    static void StartTicker()
+    {
+        try
+        {
+            _bootSeconds = 0;
+            SetTrayText("DSH 正在启动…");
+            if (_ticker == null)
+            {
+                _ticker = new System.Windows.Forms.Timer { Interval = 1000 };
+                _ticker.Tick += (s, e) =>
+                {
+                    _bootSeconds++;
+                    SetTrayText("DSH 正在启动… 已用 " + _bootSeconds + " 秒" +
+                                (_bootSeconds >= 10 ? "（npm 可能正在下载）" : ""));
+                };
+            }
+            _ticker.Start();
+        }
+        catch (Exception ex) { Trace("StartTicker failed: " + ex.Message); }
+    }
+
+    static void StopTicker()
+    {
+        try { if (_ticker != null) _ticker.Stop(); }
+        catch { }
+    }
 
     /// <summary>
     /// A faint twin of the tray icon, generated at build time by make-icon and
@@ -301,15 +338,12 @@ internal static class Dsh
                 _idleIcon = LoadDimIcon();
                 if (_idleIcon == null)
                 {
-                    // Never animate between two identical bitmaps: say so instead
-                    // of showing a blink that cannot be seen.
-                    Balloon("DSH", "Blink icon unavailable; the tray icon stays steady while the server starts.");
+                    // Never animate between two identical bitmaps. Say so, and rely
+                    // on the tooltip ticker to show that work is still happening.
+                    Balloon("DSH", "变暗图标不可用，托盘图标将保持常亮；启动进度请看托盘的悬停提示。");
                     return;
                 }
             }
-
-            _bootSeconds = 0;
-            SetTrayText("DSH is starting…");
 
             if (_blink == null)
             {
@@ -319,15 +353,6 @@ internal static class Dsh
                     if (_tray == null || _idleIcon == null) return;
                     _blinkPhase++;
                     _tray.Icon = (_blinkPhase % 2 == 0) ? _icon : _idleIcon;
-                    if (_blinkPhase % 4 == 0)
-                    {
-                        _bootSeconds += 2;
-                        // Elapsed time is the honest progress signal here: the slow
-                        // part is npm resolving the newest version, and we cannot
-                        // know its percentage.
-                        SetTrayText("DSH is starting… " + _bootSeconds + "s" +
-                                    (_bootSeconds >= 10 ? " (npm may be downloading)" : ""));
-                    }
                 };
             }
             _blink.Start();
@@ -372,9 +397,9 @@ internal static class Dsh
                 {
                     case "open": OpenBrowser(false); break;
                     case "app": OpenBrowser(true); break;
-                    case "stop": StopServer(); Ack("ok"); Info("DSH server stopped."); break;
-                    case "restart": RestartServer(); Ack("ok"); Info("DSH server restarted."); break;
-                    case "kill-orphan": KillOrphan(); Ack("ok"); Info("Orphaned DSH server cleared."); break;
+                    case "stop": StopServer(); Ack("ok"); Info("服务器已停止。"); break;
+                    case "restart": RestartServer(); Ack("ok"); Info("服务器已重启。"); break;
+                    case "kill-orphan": KillOrphan(); Ack("ok"); Info("残留服务器已清理。"); break;
                     case "copy-link": CopyOpenLink(); Ack("ok"); break;
                     case "selftest": Ui(StartSelfTest); Ack("ok"); break;
                     case "boot": Boot(false, false); break;
@@ -449,17 +474,16 @@ internal static class Dsh
             return;
         }
 
-        // Blink the tray icon while the server comes up. The slow parts are npm
-        // resolving the newest version and the process booting; neither has a
-        // knowable percentage, so the tooltip shows elapsed seconds instead.
-        Ui(StartBlink);
+        // 启动期间：图标闪烁 + 悬停提示走秒。二者相互独立，任何一条可用都能
+        // 让用户看到"正在启动"。
+        Ui(() => { StartTicker(); StartBlink(); });
         if (!SpawnServer())
         {
             Ui(() =>
             {
-                StopBlink();
-                SetTrayText("DSH could not start — see the log");
-                Balloon("DSH could not start", "npx could not be launched. Open the log from the tray menu.");
+                StopTicker(); StopBlink();
+                SetTrayText("DSH 启动失败 — 请查看日志");
+                Balloon("DSH 无法启动", "无法拉起 npx。请在托盘菜单里查看启动器日志。");
             });
             return;
         }
@@ -490,17 +514,16 @@ internal static class Dsh
 
         Ui(() =>
         {
-            StopBlink();
+            StopTicker(); StopBlink();
             SetTrayText(TipFor());
-            // One notification per outcome only. Bursts get dropped or coalesced
-            // by Windows, which is why a ready-toast fired together with a
-            // handoff-toast reads as "notifications are sometimes broken".
+            // 每种结果只提示一次：连发的气泡会被 Windows 丢弃或合并，这正是
+            // "通知有时不弹出"的原因。
             if (!silent && tokenized)
-                Balloon("DSH is ready", "Opened the harness window (" + elapsed + "s).");
+                Balloon("DSH 已就绪", "已打开界面（耗时 " + elapsed + " 秒）。");
             else if (!silent)
-                Balloon("DSH is ready",
-                    "Server is up, but no valid sign-in link was published. Use Copy open link "
-                    + "from the tray menu, or restart the server.");
+                Balloon("DSH 已就绪",
+                    "服务器已启动，但没有拿到有效的登录链接。请用托盘菜单里的「复制访问链接」，"
+                    + "或直接重启服务器。");
         });
 
         if (!silent && tokenized) OpenBrowser(appWindow);
@@ -638,8 +661,8 @@ internal static class Dsh
                 Ui(() =>
                 {
                     StopBlink();
-                    SetTrayText("DSH could not start — see the log");
-                    Balloon("DSH could not start (exit " + code + ")", why);
+                    SetTrayText("DSH 启动失败 — 请查看日志");
+                    Balloon("DSH 无法启动（退出码 " + code + "）", why);
                 });
                 return false;
             }
@@ -649,9 +672,9 @@ internal static class Dsh
         }
         Ui(() =>
         {
-            StopBlink();
-            SetTrayText("DSH did not become ready — see the log");
-            Balloon("DSH did not start", "Nothing answered on port " + Port + " in time.");
+            StopTicker(); StopBlink();
+            SetTrayText("DSH 启动超时 — 请查看日志");
+            Balloon("DSH 未能就绪", "端口 " + Port + " 在超时前没有响应。");
         });
         return false;
     }
@@ -981,8 +1004,8 @@ internal static class Dsh
         {
             Process.Start(new ProcessStartInfo(url) { UseShellExecute = true });
             if (!tokenized)
-                Ui(() => Balloon("DSH needs one tokenized visit",
-                    "Open DSH from the tray to sign this browser in once; after that the clean URL works."));
+                Ui(() => Balloon("DSH 需要一次带令牌的访问",
+                    "请从托盘菜单打开一次以完成本站登录，之后干净的地址就能直接使用。"));
             return;
         }
         catch (Exception ex) { Trace("ShellExecute failed: " + ex.Message); }
@@ -996,7 +1019,7 @@ internal static class Dsh
         catch (Exception ex)
         {
             Trace("explorer fallback failed: " + ex.Message);
-            Ui(() => Balloon("Could not open the browser", "Open " + url + " manually."));
+            Ui(() => Balloon("无法打开浏览器", "请手动访问 " + url));
         }
     }
 
@@ -1016,10 +1039,10 @@ internal static class Dsh
                 try
                 {
                     Clipboard.SetText(known);
-                    Balloon("DSH link copied",
+                    Balloon("已复制访问链接",
                         known != BaseUrl
-                            ? "Tokenized link copied (valid for this server run)."
-                            : "Clean link copied: http://127.0.0.1:3080/");
+                            ? "带令牌的链接已复制（对本次服务器运行有效）。"
+                            : "干净链接已复制：http://127.0.0.1:3080/");
                 }
                 catch (Exception ex) { Trace("clipboard failed: " + ex.Message); }
             });
@@ -1043,19 +1066,22 @@ internal static class Dsh
 
     // ---- tray (UI thread only) --------------------------------------------
     // RULE 2: handlers only enqueue. No I/O, no waiting, no HTTP.
+    // All user-facing text is Simplified Chinese: this launcher is written for a
+    // Chinese-language Windows desktop, and log lines stay English so that a
+    // support request can be pasted anywhere.
     static void BuildTray()
     {
         var menu = new ContextMenuStrip();
-        menu.Items.Add("Open DSH", null, (s, e) => EnqueueJob("open"));
-        menu.Items.Add("Open as app window", null, (s, e) => EnqueueJob("app"));
-        menu.Items.Add("Copy open link", null, (s, e) => EnqueueJob("copy-link"));
+        menu.Items.Add("打开 DSH 界面", null, (s, e) => EnqueueJob("open"));
+        menu.Items.Add("以应用窗口打开", null, (s, e) => EnqueueJob("app"));
+        menu.Items.Add("复制访问链接", null, (s, e) => EnqueueJob("copy-link"));
         menu.Items.Add(new ToolStripSeparator());
-        menu.Items.Add("Restart DSH server", null, (s, e) => EnqueueJob("restart"));
-        menu.Items.Add("Stop DSH server", null, (s, e) => EnqueueJob("stop"));
-        menu.Items.Add("Clear orphaned server", null, (s, e) => EnqueueJob("kill-orphan"));
+        menu.Items.Add("重启服务器", null, (s, e) => EnqueueJob("restart"));
+        menu.Items.Add("停止服务器", null, (s, e) => EnqueueJob("stop"));
+        menu.Items.Add("清理残留服务器", null, (s, e) => EnqueueJob("kill-orphan"));
         menu.Items.Add(new ToolStripSeparator());
 
-        _autostartItem = new ToolStripMenuItem("Start with Windows")
+        _autostartItem = new ToolStripMenuItem("开机自动启动")
         {
             CheckOnClick = true,
             Checked = IsAutostartEnabled(),
@@ -1064,16 +1090,16 @@ internal static class Dsh
         {
             bool want = _autostartItem.Checked;
             SetAutostart(want);
-            Balloon("DSH", want ? "DSH will start with Windows." : "DSH will no longer start with Windows.");
+            Balloon("DSH", want ? "已设置开机自动启动。" : "已取消开机自动启动。");
         };
         menu.Items.Add(_autostartItem);
 
         menu.Items.Add(new ToolStripSeparator());
-        menu.Items.Add("Open server log", null, (s, e) => OpenPath(LogPath));
-        menu.Items.Add("Open launcher log", null, (s, e) => OpenPath(TracePath));
-        menu.Items.Add("Open install folder", null, (s, e) => OpenPath(Home));
+        menu.Items.Add("查看服务器日志", null, (s, e) => OpenPath(LogPath));
+        menu.Items.Add("查看启动器日志", null, (s, e) => OpenPath(TracePath));
+        menu.Items.Add("打开安装目录", null, (s, e) => OpenPath(Home));
         menu.Items.Add(new ToolStripSeparator());
-        menu.Items.Add("Quit", null, (s, e) => { _quitting = true; });
+        menu.Items.Add("退出", null, (s, e) => { _quitting = true; });
 
         _tray = new NotifyIcon
         {
@@ -1085,7 +1111,7 @@ internal static class Dsh
         _tray.DoubleClick += (s, e) => EnqueueJob("open");
     }
 
-    static string TipFor() { return "DSH is running — click to open"; }
+    static string TipFor() { return "DSH 正在运行 — 点击打开界面"; }
 
     static void SetTray(string state, string tip)
     {
@@ -1137,7 +1163,7 @@ internal static class Dsh
                 beat.Stop();
                 beat.Dispose();
                 Trace("SELFTEST ticks=" + ticks + " worstStallMs=" + worst);
-                Balloon("DSH self-test", "UI thread ticks: " + ticks + ", worst stall: " + worst + " ms");
+                Balloon("DSH 自检", "UI 线程心跳 " + ticks + " 次，最坏停顿 " + worst + " 毫秒");
                 // Never sets _quitting: a diagnostic must not tear the launcher
                 // down (doing so also stopped the server the user was using).
             }
@@ -1220,7 +1246,7 @@ internal static class Dsh
             }
 
             lock (Gate) { _server = null; _url = BaseUrl; }
-            Ui(() => SetTray("stopped", "DSH is stopped"));
+            Ui(() => SetTray("stopped", "DSH 已停止"));
             Trace("server stopped");
         }
         catch (Exception ex) { Trace("StopServer failed: " + ex.Message); }
