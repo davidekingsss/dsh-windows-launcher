@@ -404,12 +404,30 @@ internal static class Dsh
 
             try
             {
+                // A plugin install ends by restarting the server itself. Letting
+                // Stop/Restart/kill-orphan run concurrently would fight it over the
+                // same port, so they are refused while an install is in flight
+                // rather than interleaved.
+                if (_marketInstalling && (job == "stop" || job == "restart" || job == "kill-orphan"))
+                {
+                    Trace("refusing '" + job + "' while dshmarket is installing");
+                    Ui(() => Balloon("DSH", "dshmarket 正在安装，请等它完成后再操作服务器。"));
+                    Ack("busy");
+                    continue;
+                }
+
                 switch (job)
                 {
                     case "open": OpenBrowser(false); break;
                     case "app": OpenBrowser(true); break;
                     case "stop": StopServer(); Ack("ok"); Info("服务器已停止。"); break;
                     case "restart": RestartServer(); Ack("ok"); Info("服务器已重启。"); break;
+                    case "restart-refresh":
+                        // 多等几秒才启动，确保新装的插件文件已落盘再被加载。
+                        RestartServer(TimeSpan.FromSeconds(4));
+                        Ack("ok");
+                        Info("服务器已重启，新插件已加载。");
+                        break;
                     case "kill-orphan": KillOrphan(); Ack("ok"); Info("残留服务器已清理。"); break;
                     case "install-market": InstallMarket(); Ack("ok"); break;
                     case "copy-link": CopyOpenLink(); Ack("ok"); break;
@@ -503,6 +521,23 @@ internal static class Dsh
         }
 
         if (!WaitReady(TimeSpan.FromMinutes(6))) return;   // already reported + stopped the blink
+
+        // A server that binds, answers once and then dies still looks ready. That
+        // is exactly the failure a bundle install can provoke (a plugin whose boot
+        // throws), and without this check the restart would be reported as
+        // successful while the server was already gone. Require it to stay alive.
+        if (!VerifyStable(TimeSpan.FromSeconds(6)))
+        {
+            Trace("server answered but did not stay up");
+            Ui(() =>
+            {
+                StopBootFeedback();
+                SetTrayText("DSH 启动后随即退出 — 请查看日志");
+                Balloon("DSH 启动失败",
+                    "服务器应答过一次但随即退出，通常是新装的插件启动报错。请查看日志。");
+            });
+            return;
+        }
 
         // Re-read the token from the log: the server prints it right about when it
         // becomes ready, and unlike state.txt this is written by the run we own.
@@ -692,9 +727,35 @@ internal static class Dsh
         return false;
     }
 
-    /// <summary>Surface the server's own last words instead of a generic message.</summary>
-    static string ReadFailureHint()
+    /// <summary>
+    /// Require the server to keep answering for the whole window, not merely once.
+    /// Returns false the moment it stops responding or its process exits, which is
+    /// how a bundle whose boot throws shows up.
+    /// </summary>
+    static bool VerifyStable(TimeSpan window)
     {
+        var sw = Stopwatch.StartNew();
+        int answers = 0;
+        while (sw.Elapsed < window)
+        {
+            Process proc;
+            lock (Gate) { proc = _server; }
+            if (proc != null && proc.HasExited)
+            {
+                Trace("VerifyStable: process exited after " + answers + " answers");
+                return false;
+            }
+            if (!ProbeReady()) { Trace("VerifyStable: stopped answering after " + answers + " answers"); return false; }
+            answers++;
+            Thread.Sleep(1000);
+        }
+        Trace("VerifyStable: " + answers + " consecutive answers over " +
+              window.TotalSeconds + "s");
+        return true;
+    }
+
+    /// <summary>Surface the server's own last words instead of a generic message.</summary>
+    static string ReadFailureHint()    {
         try
         {
             if (!File.Exists(LogPath)) return "Open the log from the tray menu for details.";
@@ -1090,6 +1151,10 @@ internal static class Dsh
         menu.Items.Add("复制访问链接", null, (s, e) => EnqueueJob("copy-link"));
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add("重启服务器", null, (s, e) => EnqueueJob("restart"));
+        // 用这个代替界面里的重启：界面上的重启走 dshmarket 的
+        // powershell -WindowStyle Hidden 包装，那个控制台在包装进程退出后变可见，
+        // 关掉它会把服务器一起杀掉。这条路径全程无窗口。
+        menu.Items.Add("重启服务器并加载新插件", null, (s, e) => EnqueueJob("restart-refresh"));
         menu.Items.Add("停止服务器", null, (s, e) => EnqueueJob("stop"));
         menu.Items.Add("清理残留服务器", null, (s, e) => EnqueueJob("kill-orphan"));
         menu.Items.Add(new ToolStripSeparator());
@@ -1450,9 +1515,24 @@ internal static class Dsh
     }
 
     // ---- lifecycle (worker thread) ----------------------------------------
-    static void RestartServer()
+    static void RestartServer() { RestartServer(TimeSpan.Zero); }
+
+    /// <summary>
+    /// Stop the server, wait for the port to actually come free, then start it
+    /// again host-only. <paramref name="settle"/> adds a deliberate pause before
+    /// booting, so a just-installed plugin's files are quiescent on disk first.
+    ///
+    /// This is the launcher's own restart and is entirely windowless. It exists as
+    /// a reliable alternative to the in-app restart, which goes through
+    /// dshmarket's restart.js: that wraps the replacement host in
+    /// `powershell -WindowStyle Hidden` to give it an inheritable console, but the
+    /// wrapper exits once it has spawned the host, the console it owned becomes
+    /// visible, and closing that window terminates the host with it.
+    /// </summary>
+    static void RestartServer(TimeSpan settle)
     {
         StopServer();
+
         // Wait for the port to actually come free. A fixed sleep races the OS
         // releasing the listening socket, and losing that race makes the new
         // server die with EADDRINUSE.
@@ -1462,7 +1542,35 @@ internal static class Dsh
             if (!ProbeReady()) break;
             Thread.Sleep(300);
         }
+
+        // Booting while the port is still held guarantees the new server dies with
+        // EADDRINUSE, and it used to do so silently — the previous code fell
+        // straight through after the timeout. Try once more to clear the holder,
+        // then report instead of launching into a known failure.
+        if (ProbeReady())
+        {
+            Trace("restart: port still held after " + sw.ElapsedMilliseconds + " ms; clearing again");
+            KillOrphan();
+            Thread.Sleep(700);
+        }
+        if (ProbeReady())
+        {
+            Trace("restart: port " + Port + " is still occupied; not starting a doomed server");
+            Ui(() =>
+            {
+                SetTrayText("DSH 重启失败 — 端口被占用");
+                Balloon("DSH 重启失败",
+                    "端口 " + Port + " 仍被占用，旧服务器没有退出。请用托盘菜单的「清理残留服务器」后再试。");
+            });
+            return;
+        }
+
         Trace("restart: port free after " + sw.ElapsedMilliseconds + " ms");
+        if (settle > TimeSpan.Zero)
+        {
+            Trace("restart: settling " + settle.TotalSeconds + "s before boot so new plugin files are quiescent");
+            Thread.Sleep((int)settle.TotalMilliseconds);
+        }
         // Restarting is not a request to open a page: pass silent=true so the
         // server comes back host-only, exactly like a fresh launch.
         Boot(true, false);
